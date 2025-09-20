@@ -6,7 +6,7 @@ import time
 import numpy as np
 import statistics
 from datetime import datetime
-from aiohttp import ClientSession, ClientResponseError
+from aiohttp import ClientSession
 import logging
 import sys
 import tkinter as tk
@@ -25,6 +25,7 @@ MAX_CONCURRENT_REQUESTS = 10
 CONFIG_FILE = 'enhanced_config.json'
 
 def load_config(config_file):
+    """Load the JSON configuration file expected by the screener."""
     if not os.path.exists(config_file):
         raise FileNotFoundError(f"Configuration file '{config_file}' not found.")
     with open(config_file, 'r') as f:
@@ -52,6 +53,8 @@ if not API_KEY:
 
 @dataclass
 class FinancialMetrics:
+    """Container for the time-series metrics required by the analysis pipeline."""
+
     revenue: List[float]
     eps: List[float]
     fcf: List[float]
@@ -66,7 +69,10 @@ class FinancialMetrics:
     pbr: List[float]
     dates: List[str]
 
+
 class MetricNormalizer:
+    """Utility class responsible for winsorizing and scaling metric sequences."""
+
     def __init__(self, winsorize_percentile: float = 0.05):
         self.winsorize_percentile = winsorize_percentile
         self.metric_ranges = {}
@@ -94,6 +100,8 @@ class MetricNormalizer:
         return [(v - min_val) / (max_val - min_val) for v in values]
 
 class GrowthQualityAnalyzer:
+    """Evaluates growth characteristics using magnitude, consistency, and sustainability."""
+
     def __init__(self, normalizer: MetricNormalizer, target_rates: Dict[str, float]):
         self.normalizer = normalizer
         self.target_rates = target_rates
@@ -190,13 +198,7 @@ class GrowthQualityAnalyzer:
         return (growth_rate - sector_median) / sector_std
 
     def calculate_growth_scores(self, metrics: FinancialMetrics, sector_revenue_median: float = 0.1, sector_revenue_std: float = 0.05) -> Dict[str, float]:
-        def calculate_cagr(end_value: float, start_value: float, periods: int) -> float:
-            try:
-                if start_value <= 0 or end_value <= 0 or periods <= 0:
-                    return 0.0
-                return (end_value / start_value) ** (1 / periods) - 1
-            except (ValueError, ZeroDivisionError):
-                return 0.0
+        """Calculate combined growth scores for revenue, EPS, and FCF time series."""
 
         revenue_cagr = calculate_cagr(metrics.revenue[-1], metrics.revenue[0], len(metrics.revenue))
         # Normalize revenue CAGR to sector
@@ -237,6 +239,8 @@ class GrowthQualityAnalyzer:
         }
 
 class RiskAssessmentModule:
+    """Calculates risk-oriented measures that complement growth analysis."""
+
     def __init__(self, normalizer: MetricNormalizer):
         self.normalizer = normalizer
 
@@ -304,6 +308,8 @@ class RiskAssessmentModule:
         return margin_risk_score
 
 class ValuationAnalyzer:
+    """Scores valuation-related metrics such as PER, PBR, and FCF yield."""
+
     def __init__(self, normalizer: MetricNormalizer, config: dict):
         self.normalizer = normalizer
         self.config = config
@@ -359,6 +365,8 @@ class ValuationAnalyzer:
             return 1 - ((peg_ratio - 0.5) / (5 - 0.5))
 
 class QualityScorer:
+    """Aggregates growth, risk, and valuation components into a quality score."""
+
     def __init__(
         self, normalizer: MetricNormalizer,
         growth_analyzer: GrowthQualityAnalyzer,
@@ -443,9 +451,11 @@ class QualityScorer:
         return final_score, component_scores
 
 def get_timestamp():
+    """Return a filesystem-friendly timestamp for output file names."""
     return datetime.now().strftime('%Y%m%d_%H%M%S')
 
 def calculate_cagr(end_value: float, start_value: float, periods: int) -> float:
+    """Safely compute the compound annual growth rate for a metric."""
     try:
         if start_value <= 0 or end_value <= 0 or periods <= 0:
             return 0.0
@@ -454,6 +464,7 @@ def calculate_cagr(end_value: float, start_value: float, periods: int) -> float:
         return 0.0
 
 async def fetch(session, url, semaphore):
+    """Fetch JSON data with retry logic while respecting rate limits."""
     wait_time = REQUEST_DELAY
     while True:
         try:
@@ -484,6 +495,7 @@ def prepare_financial_metrics(
     key_metrics: List[dict],
     financial_growth: List[dict],
 ) -> Optional[FinancialMetrics]:
+    """Create a FinancialMetrics instance from disparate financial statement payloads."""
     if not income_statements or not cash_flow_statements or not ratios or not key_metrics:
         return None
     try:
@@ -586,6 +598,7 @@ def prepare_financial_metrics(
         return None
 
 async def get_comprehensive_financial_data(session, symbol, semaphore):
+    """Fetch all remote financial datasets required for a symbol's analysis."""
     endpoints = {
         'income_statements': f"{BASE_URL_V3}/income-statement/{symbol}?limit=20&apikey={API_KEY}",
         'cash_flow_statements': f"{BASE_URL_V3}/cash-flow-statement/{symbol}?limit=20&apikey={API_KEY}",
@@ -607,7 +620,65 @@ async def get_comprehensive_financial_data(session, symbol, semaphore):
     results = dict(zip(keys, results_list))
     return results
 
+
+async def fetch_stock_profiles(session: ClientSession, symbols: List[str], semaphore: asyncio.Semaphore) -> Dict[str, dict]:
+    """Retrieve profile information for a list of symbols in manageable batches."""
+
+    profiles: List[dict] = []
+    batches = [symbols[i:i + 100] for i in range(0, len(symbols), 100)]
+    for batch in batches:
+        try:
+            profiles_url = f"{BASE_URL_V3}/profile/{','.join(batch)}?apikey={API_KEY}"
+            batch_profiles = await fetch(session, profiles_url, semaphore)
+            if isinstance(batch_profiles, list):
+                profiles.extend(
+                    [p for p in batch_profiles if isinstance(p, dict) and p.get('symbol')]
+                )
+            else:
+                logging.warning(f"Invalid profile batch response: {type(batch_profiles)}")
+        except Exception as e:
+            logging.error(f"Error fetching profiles batch: {str(e)}")
+            continue
+
+    return {profile['symbol']: profile for profile in profiles}
+
+
+def enrich_stock_with_profile(stock: dict, symbol_profile_map: Dict[str, dict]) -> None:
+    """Augment a symbol listing with profile fields used later in the pipeline."""
+
+    profile = symbol_profile_map.get(stock['symbol'])
+    if profile and isinstance(profile.get('mktCap'), (int, float)):
+        stock['sector'] = profile.get('sector', 'N/A')
+        stock['companyName'] = profile.get('companyName', 'N/A')
+        stock['market_cap'] = profile.get('mktCap')
+    else:
+        stock['sector'] = 'N/A'
+        stock['companyName'] = 'N/A'
+        stock['market_cap'] = 0
+
+
+def filter_stocks_by_initial_criteria(stocks: List[dict], initial_filters: Dict[str, float]) -> List[dict]:
+    """Apply market-cap and sector filters to NASDAQ listings."""
+
+    filtered: List[dict] = []
+    for stock in stocks:
+        market_cap = stock.get('market_cap')
+        if not isinstance(market_cap, (int, float)):
+            continue
+
+        if not (initial_filters['market_cap_min'] <= market_cap <= initial_filters['market_cap_max']):
+            continue
+
+        if initial_filters.get('exclude_financial_sector', False) and stock.get('sector') == 'Financial Services':
+            continue
+
+        filtered.append(stock)
+
+    return filtered
+
+
 def write_enhanced_output(filename: str, data: dict):
+    """Persist a human-readable summary of the screening results."""
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(f"Screened {data['total_stocks']} NASDAQ stocks. "
                 f"Found {data['passed_stocks_count']} qualifying stocks.\n\n")
@@ -655,6 +726,7 @@ def write_enhanced_output(filename: str, data: dict):
             f.write("\n" + "-" * 80 + "\n\n")
 
 def write_excel_output(filename: str, data: dict):
+    """Persist screening results as a formatted Excel workbook."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Screened Stocks Results"
@@ -709,7 +781,8 @@ def write_excel_output(filename: str, data: dict):
 
     wb.save(filename)
 
-async def screen_nasdaq(initial_filters, weights):
+async def screen_nasdaq(initial_filters):
+    """Run the end-to-end NASDAQ screening workflow."""
     start_time = time.time()
     failed_symbols = {}
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -734,43 +807,12 @@ async def screen_nasdaq(initial_filters, weights):
         logging.info(f"Retrieved {total_stocks} NASDAQ symbols.")
 
         symbols = [stock['symbol'] for stock in nasdaq_stocks]
-        batches = [symbols[i:i + 100] for i in range(0, len(symbols), 100)]
-        profiles = []
-        for batch in batches:
-            try:
-                profiles_url = f"{BASE_URL_V3}/profile/{','.join(batch)}?apikey={API_KEY}"
-                batch_profiles = await fetch(session, profiles_url, semaphore)
-                if isinstance(batch_profiles, list):
-                    profiles.extend([
-                        p for p in batch_profiles
-                        if isinstance(p, dict) and p.get('symbol')
-                    ])
-                else:
-                    logging.warning(f"Invalid profile batch response: {type(batch_profiles)}")
-            except Exception as e:
-                logging.error(f"Error fetching profiles batch: {str(e)}")
-                continue
-
-        symbol_profile_map = {profile['symbol']: profile for profile in profiles}
+        symbol_profile_map = await fetch_stock_profiles(session, symbols, semaphore)
 
         for stock in nasdaq_stocks:
-            profile = symbol_profile_map.get(stock['symbol'])
-            if profile and isinstance(profile.get('mktCap'), (int, float)):
-                stock['sector'] = profile.get('sector', 'N/A')
-                stock['companyName'] = profile.get('companyName', 'N/A')
-                stock['market_cap'] = profile.get('mktCap')
-            else:
-                stock['sector'] = 'N/A'
-                stock['companyName'] = 'N/A'
-                stock['market_cap'] = 0
+            enrich_stock_with_profile(stock, symbol_profile_map)
 
-        filtered_stocks = [
-            stock for stock in nasdaq_stocks
-            if stock['market_cap'] is not None and
-            isinstance(stock['market_cap'], (int, float)) and
-            (initial_filters['market_cap_min'] <= stock['market_cap'] <= initial_filters['market_cap_max']) and
-            (not initial_filters.get('exclude_financial_sector', False) or stock['sector'] != 'Financial Services')
-        ]
+        filtered_stocks = filter_stocks_by_initial_criteria(nasdaq_stocks, initial_filters)
 
         logging.info(f"Market cap screening complete. {len(filtered_stocks)} stocks passed.")
 
@@ -902,6 +944,7 @@ async def screen_nasdaq(initial_filters, weights):
         logging.info(f"Results written to {filename_txt} and {filename_xlsx}")
 
 def deep_update(d, u):
+    """Recursively merge dictionary ``u`` into dictionary ``d``."""
     for k, v in u.items():
         if isinstance(v, dict) and k in d:
             deep_update(d[k], v)
@@ -909,6 +952,7 @@ def deep_update(d, u):
             d[k] = v
 
 def create_gui():
+    """Instantiate and configure the Tkinter-based configuration GUI."""
     root = tk.Tk()
     root.title("Enhanced NASDAQ Stock Screener")
 
@@ -971,9 +1015,10 @@ def create_gui():
     return root
 
 async def main(user_config=None):
+    """Entry point allowing optional runtime configuration overrides."""
     if user_config:
         deep_update(config, user_config)
-    await screen_nasdaq(config['initial_filters'], config['scoring']['weights'])
+    await screen_nasdaq(config['initial_filters'])
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--no-gui":
